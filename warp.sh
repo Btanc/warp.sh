@@ -233,6 +233,15 @@ TestIPv6_1='2606:4700:4700::1001'
 TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
 
+Usque_BinPath='/usr/local/bin/usque'
+Usque_ConfigDir='/etc/usque'
+Usque_ConfigPath="${Usque_ConfigDir}/config.json"
+Usque_SettingsPath="${Usque_ConfigDir}/proxy.conf"
+Usque_Service='usque-warp'
+Usque_ServicePath="/etc/systemd/system/${Usque_Service}.service"
+Usque_Bind='127.0.0.1'
+Usque_Port='40000'
+
 Get_System_Info() {
     source /etc/os-release
     SysInfo_OS_CodeName="${VERSION_CODENAME}"
@@ -464,6 +473,33 @@ Enable_WARP_Client_Proxy() {
 
 Get_WARP_Proxy_Port() {
     WARP_Proxy_Port='40000'
+}
+
+Get_WARP_Upstream_Protocol() {
+    local settings protocol
+    WARP_Upstream_Protocol_zh='未检测'
+    WARP_Upstream_Protocol_en='Unknown'
+    if [[ ${WARP_Client_Status} != active ]] || ! command -v warp-cli >/dev/null 2>&1; then
+        return 0
+    fi
+    settings=$(warp_cli_run settings 2>/dev/null) || return 0
+    protocol=$(printf '%s\n' "${settings}" | awk '
+        tolower($0) ~ /tunnel protocol[[:space:]]*:/ {
+            sub(/^.*:[[:space:]]*/, "")
+            sub(/[[:space:]]+$/, "")
+            print
+            exit
+        }')
+    case ${protocol,,} in
+    wireguard)
+        WARP_Upstream_Protocol_zh='WireGuard / UDP'
+        WARP_Upstream_Protocol_en='WireGuard / UDP'
+        ;;
+    masque)
+        WARP_Upstream_Protocol_zh='MASQUE'
+        WARP_Upstream_Protocol_en='MASQUE'
+        ;;
+    esac
 }
 
 Print_Delimiter() {
@@ -908,6 +944,7 @@ Check_WARP_Client_Status() {
 
 Check_WARP_Proxy_Status() {
     Check_WARP_Client
+    Get_WARP_Upstream_Protocol
     if [[ ${WARP_Client_Status} = active ]]; then
         Get_WARP_Proxy_Port
         WARP_Proxy_Status=$(curl -sx "socks5h://127.0.0.1:${WARP_Proxy_Port}" ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
@@ -1008,7 +1045,7 @@ Check_WARP_WireGuard_Status() {
         fi
         ;;
     esac
-    if [[ ${IPv4Status} = off && ${IPv6Status} = off ]]; then
+    if [[ ${WireGuard_Status} = active && ${IPv4Status} = off && ${IPv6Status} = off ]]; then
         log ERROR "Cloudflare WARP network anomaly, WireGuard tunnel established failed."
         Disable_WireGuard
         exit 1
@@ -1020,6 +1057,7 @@ Check_ALL_Status() {
     Check_WARP_Proxy_Status
     Check_WireGuard_Status
     Check_WARP_WireGuard_Status
+    Check_Usque_Status
 }
 
 Print_WARP_Client_Status() {
@@ -1030,7 +1068,7 @@ Print_WARP_Client_Status() {
     echo -e "
  ----------------------------
  WARP Client\t: ${WARP_Client_Status_en}
- SOCKS5 Port\t: ${WARP_Proxy_Status_en}
+ SOCKS5 Port (upstream: ${WARP_Upstream_Protocol_en})\t: ${WARP_Proxy_Status_en}
  ----------------------------
 "
     log INFO "Done."
@@ -1056,11 +1094,14 @@ Print_ALL_Status() {
     echo -e "
  ----------------------------
  WARP Client\t: ${WARP_Client_Status_en}
- SOCKS5 Port\t: ${WARP_Proxy_Status_en}
+ SOCKS5 Port (upstream: ${WARP_Upstream_Protocol_en})\t: ${WARP_Proxy_Status_en}
  ----------------------------
  WireGuard\t: ${WireGuard_Status_en}
  IPv4 Network\t: ${WARP_IPv4_Status_en}
  IPv6 Network\t: ${WARP_IPv6_Status_en}
+ ----------------------------
+ usque\t\t: ${Usque_Status_en}
+ SOCKS5 (upstream: HTTP/2 / TCP+TLS): ${Usque_Listen_Address_en}
  ----------------------------
 "
 }
@@ -1158,24 +1199,477 @@ Set_WARP_DualStack_nonGlobal() {
     Print_WARP_WireGuard_Status
 }
 
+Usque_Require_Command() {
+    local command_name
+    for command_name in "$@"; do
+        if ! command -v "${command_name}" >/dev/null 2>&1; then
+            log ERROR "Required command is not installed: ${command_name}"
+            return 1
+        fi
+    done
+}
+
+Usque_Require_Systemd() {
+    Usque_Require_Command systemctl || return 1
+    if ! systemctl show --property=Version --value >/dev/null 2>&1; then
+        log ERROR "A running systemd instance is required for usque."
+        return 1
+    fi
+}
+
+Validate_Usque_Settings() {
+    local bind="${1-${Usque_Bind}}" port="${2-${Usque_Port}}" octet
+    local -a octets
+    if [[ ! ${bind} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        log ERROR "usque bind address must be an IPv4 address."
+        return 1
+    fi
+    IFS=. read -r -a octets <<< "${bind}"
+    for octet in "${octets[@]}"; do
+        if (( 10#${octet} > 255 )) || [[ ${octet} != 0 && ${octet} = 0* ]]; then
+            log ERROR "Invalid usque IPv4 address: ${bind}"
+            return 1
+        fi
+    done
+    if [[ ! ${port} =~ ^[0-9]{1,5}$ ]] || (( 10#${port} < 1 || 10#${port} > 65535 )); then
+        log ERROR "usque port must be between 1 and 65535."
+        return 1
+    fi
+}
+
+Load_Usque_Settings() {
+    local bind='127.0.0.1' port='40000' line seen_bind=0 seen_port=0
+    if [[ -e ${Usque_SettingsPath} || -L ${Usque_SettingsPath} ]]; then
+        if [[ ! -f ${Usque_SettingsPath} || ! -r ${Usque_SettingsPath} || -L ${Usque_SettingsPath} ]]; then
+            log ERROR "Cannot read usque settings: ${Usque_SettingsPath}"
+            return 1
+        fi
+        while IFS= read -r line || [[ -n ${line} ]]; do
+            case "${line}" in
+            '' | \#*) ;;
+            bind=*)
+                (( seen_bind == 0 )) || return 1
+                bind="${line#bind=}"
+                seen_bind=1
+                ;;
+            port=*)
+                (( seen_port == 0 )) || return 1
+                port="${line#port=}"
+                seen_port=1
+                ;;
+            *)
+                log ERROR "Invalid usque settings; only bind and port are supported."
+                return 1
+                ;;
+            esac
+        done < "${Usque_SettingsPath}"
+    fi
+    Validate_Usque_Settings "${bind}" "${port}" || return 1
+    Usque_Bind="${bind}"
+    Usque_Port="$((10#${port}))"
+}
+
+Check_Usque_Port() {
+    local port="${1:-${Usque_Port}}" allow_self="${2:-no}" listeners line main_pid=''
+    Usque_Require_Command ss || return 1
+    if ! listeners=$(ss -H -ltnp "sport = :${port}" 2>/dev/null); then
+        log ERROR "Failed to inspect TCP listening ports."
+        return 1
+    fi
+    [[ -z ${listeners} ]] && return 0
+    if [[ ${allow_self} = yes ]]; then
+        main_pid=$(systemctl show "${Usque_Service}" --property=MainPID --value 2>/dev/null)
+    fi
+    while IFS= read -r line; do
+        if [[ ${main_pid} =~ ^[1-9][0-9]*$ && ${line} = *"pid=${main_pid},"* ]]; then
+            continue
+        fi
+        log ERROR "TCP port ${port} is already in use by another process."
+        return 1
+    done <<< "${listeners}"
+}
+
+Write_Usque_Service() {
+    local unit_tmp
+    unit_tmp=$(mktemp "${Usque_ServicePath}.XXXXXX") || return 1
+    if ! cat > "${unit_tmp}" <<EOF
+[Unit]
+Description=usque Cloudflare WARP SOCKS5 proxy (HTTP/2)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+Environment="HTTP_PROXY=" "HTTPS_PROXY=" "ALL_PROXY=" "http_proxy=" "https_proxy=" "all_proxy="
+ExecStart="${Usque_BinPath}" -c "${Usque_ConfigPath}" socks --http2 --always-reconnect -b ${Usque_Bind} -p ${Usque_Port}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=20
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    then
+        rm -f "${unit_tmp}"
+        return 1
+    fi
+    if ! chmod 644 "${unit_tmp}" || ! mv -f "${unit_tmp}" "${Usque_ServicePath}"; then
+        rm -f "${unit_tmp}"
+        return 1
+    fi
+}
+
+Wait_Usque_Proxy() {
+    local attempt listeners main_pid
+    for (( attempt=0; attempt<10; attempt++ )); do
+        if systemctl is-active --quiet "${Usque_Service}"; then
+            main_pid=$(systemctl show "${Usque_Service}" --property=MainPID --value 2>/dev/null)
+            listeners=$(ss -H -ltnp "sport = :${Usque_Port}" 2>/dev/null) || return 1
+            if [[ ${main_pid} =~ ^[1-9][0-9]*$ && ${listeners} = *"pid=${main_pid},"* ]]; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    log ERROR "usque failed to listen on ${Usque_Bind}:${Usque_Port}; check the service logs in menu 9, option 7."
+    return 1
+}
+
+Install_Usque() {
+    local arch tag release asset staging checksum actual running=no
+    Usque_Require_Systemd || return 1
+    Usque_Require_Command curl unzip sha256sum ss install mktemp || return 1
+    case $(uname -m) in
+    x86_64 | amd64) arch='amd64' ;;
+    aarch64 | arm64) arch='arm64' ;;
+    armv5*) arch='armv5' ;;
+    armv6*) arch='armv6' ;;
+    armv7* | armv8l) arch='armv7' ;;
+    *) log ERROR "Unsupported usque CPU architecture: $(uname -m)"; return 1 ;;
+    esac
+    if ! release=$(curl -fsSL --connect-timeout 10 --max-time 60 'https://api.github.com/repos/Diniboy1123/usque/releases/latest'); then
+        log ERROR "Failed to find the latest stable usque release."
+        return 1
+    fi
+    tag=$(printf '%s\n' "${release}" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+    if [[ ! ${tag} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log ERROR "Invalid stable usque release version."
+        return 1
+    fi
+    asset="usque_${tag#v}_linux_${arch}.zip"
+    install -d -m 755 "$(dirname "${Usque_BinPath}")" || return 1
+    staging=$(mktemp -d "${Usque_BinPath}.install.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 -o "${staging}/${asset}" "https://github.com/Diniboy1123/usque/releases/download/${tag}/${asset}" ||
+        ! curl -fsSL --connect-timeout 10 --max-time 60 -o "${staging}/checksums.txt" "https://github.com/Diniboy1123/usque/releases/download/${tag}/checksums.txt"; then
+        log ERROR "Failed to download usque; the installed binary was preserved."
+        rm -rf "${staging}"
+        return 1
+    fi
+    checksum=$(awk -v name="${asset}" '$2 == name || $2 == "*" name {print $1}' "${staging}/checksums.txt")
+    actual=$(sha256sum "${staging}/${asset}") || actual=''
+    actual="${actual%% *}"
+    if [[ ! ${checksum} =~ ^[0-9a-fA-F]{64}$ || ${actual,,} != "${checksum,,}" ]]; then
+        log ERROR "usque SHA256 verification failed; the installed binary was preserved."
+        rm -rf "${staging}"
+        return 1
+    fi
+    if ! unzip -p "${staging}/${asset}" usque > "${staging}/usque" ||
+        [[ ! -s ${staging}/usque ]] || ! chmod 755 "${staging}/usque" ||
+        ! "${staging}/usque" -c /dev/null version >/dev/null 2>&1; then
+        log ERROR "Failed to extract or execute usque; the installed binary was preserved."
+        rm -rf "${staging}"
+        return 1
+    fi
+    if systemctl is-active --quiet "${Usque_Service}"; then
+        running=yes
+        Load_Usque_Settings || { rm -rf "${staging}"; return 1; }
+    fi
+    if [[ -e ${Usque_BinPath} ]]; then
+        if [[ ! -f ${Usque_BinPath} || -L ${Usque_BinPath} ]] || ! cp -p "${Usque_BinPath}" "${staging}/previous"; then
+            log ERROR "Cannot back up the installed usque binary."
+            rm -rf "${staging}"
+            return 1
+        fi
+    elif [[ ${running} = yes ]]; then
+        log ERROR "Cannot update a running usque service without its original binary."
+        rm -rf "${staging}"
+        return 1
+    fi
+    if ! mv -f "${staging}/usque" "${Usque_BinPath}"; then
+        rm -rf "${staging}"
+        return 1
+    fi
+    if [[ ${running} = yes ]] && { ! systemctl restart "${Usque_Service}" || ! Wait_Usque_Proxy; }; then
+        log ERROR "The updated usque failed to start; restoring the previous binary."
+        if ! mv -f "${staging}/previous" "${Usque_BinPath}"; then
+            log ERROR "Failed to restore the previous binary; backup retained at ${staging}/previous."
+            return 1
+        fi
+        if ! systemctl restart "${Usque_Service}" || ! Wait_Usque_Proxy; then
+            log ERROR "Failed to restart the restored usque binary."
+        fi
+        rm -rf "${staging}"
+        return 1
+    fi
+    rm -rf "${staging}"
+    log INFO "usque ${tag} installed successfully."
+}
+
+Prepare_Usque_Config() {
+    local output
+    install -d -m 700 "${Usque_ConfigDir}" || return 1
+    if [[ ! -e ${Usque_ConfigPath} && ! -L ${Usque_ConfigPath} ]]; then
+        if [[ -e ./config.json ]]; then
+            if [[ ! -f ./config.json || ! -s ./config.json ]] || ! install -m 600 ./config.json "${Usque_ConfigPath}"; then
+                log ERROR "Failed to import config.json; fix the existing account file before retrying."
+                return 1
+            fi
+        else
+            Usque_Require_Command timeout env || return 1
+            log INFO "Registering a new usque account and accepting Cloudflare's terms of service..."
+            if ! (umask 077; timeout 90 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "${Usque_BinPath}" -c "${Usque_ConfigPath}" register --accept-tos >/dev/null 2>&1); then
+                log ERROR "usque account registration failed. Any generated account file has been preserved."
+                return 1
+            fi
+        fi
+    fi
+    if [[ ! -f ${Usque_ConfigPath} || ! -s ${Usque_ConfigPath} || -L ${Usque_ConfigPath} ]]; then
+        log ERROR "The existing usque account file is invalid; it was preserved for manual repair."
+        return 1
+    fi
+    chmod 600 "${Usque_ConfigPath}" || return 1
+    # The version command runs upstream's config loader without starting a tunnel.
+    output=$("${Usque_BinPath}" -c "${Usque_ConfigPath}" version 2>&1) || return 1
+    if [[ ${output} = *'Config file not found:'* ]]; then
+        log ERROR "Cannot parse the existing usque account file; it was preserved for manual repair."
+        return 1
+    fi
+}
+
+Enable_Usque_Proxy() {
+    Usque_Require_Systemd || return 1
+    Usque_Require_Command ss install mktemp || return 1
+    Load_Usque_Settings || return 1
+    if systemctl is-active --quiet "${Usque_Service}"; then
+        Check_Usque_Port "${Usque_Port}" yes || return 1
+        Wait_Usque_Proxy || return 1
+        systemctl enable "${Usque_Service}" || return 1
+        log INFO "usque is already running at ${Usque_Bind}:${Usque_Port}."
+        return 0
+    fi
+    [[ -x ${Usque_BinPath} ]] || Install_Usque || return 1
+    Check_Usque_Port || return 1
+    Prepare_Usque_Config || return 1
+    if [[ ! -e ${Usque_SettingsPath} ]]; then
+        (umask 077; printf 'bind=%s\nport=%s\n' "${Usque_Bind}" "${Usque_Port}" > "${Usque_SettingsPath}") || return 1
+    fi
+    if ! Write_Usque_Service || ! systemctl daemon-reload ||
+        ! systemctl enable --now "${Usque_Service}" || ! Wait_Usque_Proxy; then
+        log ERROR "Failed to enable usque SOCKS5 proxy."
+        return 1
+    fi
+    log INFO "usque SOCKS5 proxy enabled at ${Usque_Bind}:${Usque_Port} (HTTP/2)."
+}
+
+Disable_Usque_Proxy() {
+    local load_state
+    Usque_Require_Systemd || return 1
+    load_state=$(systemctl show "${Usque_Service}" --property=LoadState --value) || return 1
+    if [[ ${load_state} = not-found ]]; then
+        log INFO "usque service is not installed."
+        return 0
+    fi
+    if ! systemctl disable --now "${Usque_Service}"; then
+        log ERROR "Failed to stop and disable usque."
+        return 1
+    fi
+    log INFO "usque stopped and disabled. Account and proxy settings were preserved."
+}
+
+Restart_Usque_Proxy() {
+    Usque_Require_Systemd || return 1
+    Usque_Require_Command ss || return 1
+    Load_Usque_Settings || return 1
+    [[ -x ${Usque_BinPath} ]] || { log ERROR "usque is not installed."; return 1; }
+    Check_Usque_Port "${Usque_Port}" yes || return 1
+    if ! systemctl restart "${Usque_Service}" || ! Wait_Usque_Proxy; then
+        log ERROR "Failed to restart usque."
+        return 1
+    fi
+    log INFO "usque SOCKS5 proxy restarted."
+}
+
+Configure_Usque_Proxy() {
+    local bind port previous_bind previous_port backup running=no had_settings=no had_unit=no failed=no restore_failed=no
+    Usque_Require_Systemd || return 1
+    Usque_Require_Command ss install mktemp || return 1
+    Load_Usque_Settings || return 1
+    previous_bind="${Usque_Bind}"
+    previous_port="${Usque_Port}"
+    if (( $# == 0 )); then
+        read -r -p "监听 IPv4 地址 [${Usque_Bind}]: " bind || return 1
+        read -r -p "SOCKS5 端口（上游：HTTP/2 / TCP+TLS）[${Usque_Port}]: " port || return 1
+    else
+        bind="$1"
+        port="${2:-${Usque_Port}}"
+    fi
+    bind="${bind:-${Usque_Bind}}"
+    port="${port:-${Usque_Port}}"
+    Validate_Usque_Settings "${bind}" "${port}" || return 1
+    port="$((10#${port}))"
+    if systemctl is-active --quiet "${Usque_Service}"; then running=yes; fi
+    Check_Usque_Port "${port}" "${running}" || return 1
+    install -d -m 700 "${Usque_ConfigDir}" || return 1
+    backup=$(mktemp -d "${Usque_ConfigDir}/.proxy.XXXXXX") || return 1
+    if [[ -e ${Usque_SettingsPath} ]]; then
+        had_settings=yes
+        cp -p "${Usque_SettingsPath}" "${backup}/proxy.conf" || { rm -rf "${backup}"; return 1; }
+    fi
+    if [[ -e ${Usque_ServicePath} ]]; then
+        had_unit=yes
+        cp -p "${Usque_ServicePath}" "${backup}/service" || { rm -rf "${backup}"; return 1; }
+    fi
+    Usque_Bind="${bind}"
+    Usque_Port="${port}"
+    if ! (umask 077; printf 'bind=%s\nport=%s\n' "${bind}" "${port}" > "${backup}/new.conf") ||
+        ! mv -f "${backup}/new.conf" "${Usque_SettingsPath}" ||
+        ! Write_Usque_Service || ! systemctl daemon-reload; then
+        failed=yes
+    elif [[ ${running} = yes ]] && { ! systemctl restart "${Usque_Service}" || ! Wait_Usque_Proxy; }; then
+        failed=yes
+    fi
+    if [[ ${failed} = yes ]]; then
+        Usque_Bind="${previous_bind}"
+        Usque_Port="${previous_port}"
+        if [[ ${had_settings} = yes ]]; then
+            cp -p "${backup}/proxy.conf" "${Usque_SettingsPath}" || restore_failed=yes
+        else
+            rm -f "${Usque_SettingsPath}" || restore_failed=yes
+        fi
+        if [[ ${had_unit} = yes ]]; then
+            cp -p "${backup}/service" "${Usque_ServicePath}" || restore_failed=yes
+        else
+            rm -f "${Usque_ServicePath}" || restore_failed=yes
+        fi
+        if [[ ${restore_failed} = yes ]]; then
+            log ERROR "Failed to restore configuration files; backups retained in ${backup}."
+            return 1
+        fi
+        if ! systemctl daemon-reload || { [[ ${running} = yes ]] && { ! systemctl restart "${Usque_Service}" || ! Wait_Usque_Proxy; }; }; then
+            log ERROR "Configuration restored, but the previous usque service could not be restarted."
+            rm -rf "${backup}"
+            return 1
+        fi
+        rm -rf "${backup}"
+        log ERROR "Failed to apply usque settings; the previous configuration was restored."
+        return 1
+    fi
+    rm -rf "${backup}"
+    log INFO "usque proxy configured at ${Usque_Bind}:${Usque_Port}."
+}
+
+Test_Usque_Proxy() {
+    local trace bind
+    Usque_Require_Systemd || return 1
+    Usque_Require_Command curl ss || return 1
+    Load_Usque_Settings || return 1
+    if ! systemctl is-active --quiet "${Usque_Service}"; then
+        log ERROR "usque is not running; enable it before testing the proxy."
+        return 1
+    fi
+    Check_Usque_Port "${Usque_Port}" yes || return 1
+    Wait_Usque_Proxy || return 1
+    bind="${Usque_Bind}"
+    [[ ${bind} = 0.0.0.0 ]] && bind='127.0.0.1'
+    if ! trace=$(curl -fsS --noproxy '' --proxy "socks5h://${bind}:${Usque_Port}" --connect-timeout 5 --max-time 15 "${CF_Trace_URL}"); then
+        log ERROR "Failed to connect through the usque SOCKS5 proxy."
+        return 1
+    fi
+    if ! printf '%s\n' "${trace}" | grep -qE '^warp=(on|plus)$'; then
+        log ERROR "usque proxy did not return an active WARP trace."
+        return 1
+    fi
+    printf '%s\n' "${trace}"
+    log INFO "usque SOCKS5 proxy test passed."
+}
+
+Print_Usque_Log() {
+    Usque_Require_Command journalctl || return 1
+    journalctl -u "${Usque_Service}" -n 80 --no-pager
+}
+
+Uninstall_Usque() {
+    Disable_Usque_Proxy || return 1
+    if ! rm -f "${Usque_BinPath}" "${Usque_ServicePath}" || ! systemctl daemon-reload; then
+        log ERROR "Failed to uninstall usque."
+        return 1
+    fi
+    systemctl reset-failed "${Usque_Service}" >/dev/null 2>&1 || true
+    log INFO "usque uninstalled. Account and proxy settings remain in ${Usque_ConfigDir}."
+}
+
+Check_Usque_Status() {
+    local enabled output
+    Usque_Status='not-installed'
+    Usque_Status_zh='未安装'
+    Usque_Status_en='Not installed'
+    Usque_Version='-'
+    Usque_SelfStart_zh='未启用'
+    Usque_SelfStart_en='Disabled'
+    Usque_Listen_Address_zh='配置异常（请检查 proxy.conf）'
+    Usque_Listen_Address_en='Invalid proxy.conf'
+    if Load_Usque_Settings; then
+        Usque_Listen_Address_zh="socks5://${Usque_Bind}:${Usque_Port}"
+        Usque_Listen_Address_en="${Usque_Listen_Address_zh}"
+    fi
+    if [[ -x ${Usque_BinPath} ]]; then
+        output=$("${Usque_BinPath}" -c /dev/null version 2>/dev/null)
+        Usque_Version=$(printf '%s\n' "${output}" | sed -n 's/^usque version: //p' | head -n 1)
+        Usque_Version="${Usque_Version:--}"
+        Usque_Status='inactive'
+        Usque_Status_zh='未运行'
+        Usque_Status_en='Stopped'
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet "${Usque_Service}"; then
+            Usque_Status='active'
+            Usque_Status_zh='运行中'
+            Usque_Status_en='Running'
+        elif systemctl is-failed --quiet "${Usque_Service}"; then
+            Usque_Status='failed'
+            Usque_Status_zh='启动失败'
+            Usque_Status_en='Failed'
+        fi
+        enabled=$(systemctl is-enabled "${Usque_Service}" 2>/dev/null)
+        if [[ ${enabled} = enabled ]]; then
+            Usque_SelfStart_zh='已启用'
+            Usque_SelfStart_en='Enabled'
+        fi
+    fi
+}
+
 Menu_Title="${FontColor_Yellow_Bold}Cloudflare WARP 一键安装脚本${FontColor_Suffix} ${FontColor_Red}[${shVersion}]${FontColor_Suffix} by ${FontColor_Purple_Bold}P3TERX.COM${FontColor_Suffix}"
 
 Menu_WARP_Client() {
+    Check_WARP_Client
+    Get_WARP_Upstream_Protocol
     clear
     echo -e "
 ${Menu_Title}
 
  -------------------------
  WARP 客户端状态 : ${WARP_Client_Status_zh}
- SOCKS5 代理端口 : ${WARP_Proxy_Status_zh}
+ SOCKS5 代理端口（上游：${WARP_Upstream_Protocol_zh}）: ${WARP_Proxy_Status_zh}
  -------------------------
 
 管理 WARP 官方客户端：
 
  ${FontColor_Green_Bold}0${FontColor_Suffix}. 返回主菜单
  -
- ${FontColor_Green_Bold}1${FontColor_Suffix}. 开启 SOCKS5 代理
- ${FontColor_Green_Bold}2${FontColor_Suffix}. 关闭 SOCKS5 代理
+ ${FontColor_Green_Bold}1${FontColor_Suffix}. 开启 SOCKS5 代理（上游：${WARP_Upstream_Protocol_zh}）
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. 关闭 SOCKS5 代理（上游：${WARP_Upstream_Protocol_zh}）
  ${FontColor_Green_Bold}3${FontColor_Suffix}. 重启 WARP 官方客户端
  ${FontColor_Green_Bold}4${FontColor_Suffix}. 卸载 WARP 官方客户端
  ${FontColor_Green_Bold}5${FontColor_Suffix}. 关闭 WARP 官方客户端（保留配置，禁用开机启动）
@@ -1253,6 +1747,50 @@ ${Menu_Title}
     esac
 }
 
+Menu_Usque() {
+    local choice
+    Check_Usque_Status || return 1
+    clear
+    echo -e "
+${Menu_Title}
+
+管理 usque（WARP 代理）：
+
+ -------------------------
+ usque 版本    : ${Usque_Version}
+ 服务状态     : ${Usque_Status_zh}
+ SOCKS5 地址（上游：HTTP/2 / TCP+TLS）: ${Usque_Listen_Address_zh}
+ 开机启动     : ${Usque_SelfStart_zh}
+ 账户配置     : ${Usque_ConfigPath}
+ -------------------------
+
+ ${FontColor_Green_Bold}0${FontColor_Suffix}. 返回主菜单
+ -
+ ${FontColor_Green_Bold}1${FontColor_Suffix}. 安装或更新 usque
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. 开启 SOCKS5 代理（上游：HTTP/2 / TCP+TLS）
+ ${FontColor_Green_Bold}3${FontColor_Suffix}. 关闭 SOCKS5 代理（上游：HTTP/2 / TCP+TLS）
+ ${FontColor_Green_Bold}4${FontColor_Suffix}. 重启 SOCKS5 代理（上游：HTTP/2 / TCP+TLS）
+ ${FontColor_Green_Bold}5${FontColor_Suffix}. 修改监听地址和端口
+ ${FontColor_Green_Bold}6${FontColor_Suffix}. 检查代理连通性
+ ${FontColor_Green_Bold}7${FontColor_Suffix}. 查看服务日志
+ ${FontColor_Green_Bold}8${FontColor_Suffix}. 卸载 usque（保留账户配置）
+"
+    read -rp "请输入选项: " choice || return 1
+    echo
+    case ${choice} in
+    0) Start_Menu ;;
+    1) Install_Usque ;;
+    2) Enable_Usque_Proxy ;;
+    3) Disable_Usque_Proxy ;;
+    4) Restart_Usque_Proxy ;;
+    5) Configure_Usque_Proxy ;;
+    6) Test_Usque_Proxy ;;
+    7) Print_Usque_Log ;;
+    8) Uninstall_Usque ;;
+    *) log ERROR "无效输入！"; return 1 ;;
+    esac
+}
+
 Start_Menu() {
     log INFO "正在检查状态..."
     Check_ALL_Status
@@ -1262,7 +1800,7 @@ ${Menu_Title}
 
  -------------------------
  WARP 客户端状态 : ${WARP_Client_Status_zh}
- SOCKS5 代理端口 : ${WARP_Proxy_Status_zh}
+ SOCKS5 代理端口（上游：${WARP_Upstream_Protocol_zh}）: ${WARP_Proxy_Status_zh}
  -------------------------
  WireGuard 状态 : ${WireGuard_Status_zh}
  IPv4 网络状态  : ${WARP_IPv4_Status_zh}
@@ -1270,7 +1808,7 @@ ${Menu_Title}
  -------------------------
 
  ${FontColor_Green_Bold}1${FontColor_Suffix}. 安装 Cloudflare WARP 官方客户端
- ${FontColor_Green_Bold}2${FontColor_Suffix}. 自动配置 WARP 客户端 SOCKS5 代理
+ ${FontColor_Green_Bold}2${FontColor_Suffix}. 自动配置 WARP 客户端 SOCKS5 代理（上游：${WARP_Upstream_Protocol_zh}）
  ${FontColor_Green_Bold}3${FontColor_Suffix}. 管理 Cloudflare WARP 官方客户端
  -
  ${FontColor_Green_Bold}4${FontColor_Suffix}. 安装 WireGuard 相关组件
@@ -1278,6 +1816,8 @@ ${Menu_Title}
  ${FontColor_Green_Bold}6${FontColor_Suffix}. 自动配置 WARP WireGuard IPv6 网络
  ${FontColor_Green_Bold}7${FontColor_Suffix}. 自动配置 WARP WireGuard 双栈全局网络
  ${FontColor_Green_Bold}8${FontColor_Suffix}. 管理 WARP WireGuard 网络
+ -
+ ${FontColor_Green_Bold}9${FontColor_Suffix}. 管理 usque（WARP 代理）
 "
     unset MenuNumber
     read -p "请输入选项: " MenuNumber
@@ -1307,6 +1847,9 @@ ${Menu_Title}
     8)
         Menu_WARP_WireGuard
         ;;
+    9)
+        Menu_Usque
+        ;;
     *)
         log ERROR "无效输入！"
         sleep 2s
@@ -1326,7 +1869,7 @@ SUBCOMMANDS:
     install         Install Cloudflare WARP Official Linux Client
     uninstall       uninstall Cloudflare WARP Official Linux Client
     restart         Restart Cloudflare WARP Official Linux Client
-    proxy           Enable WARP Client Proxy Mode (default SOCKS5 port: 40000)
+    proxy           Enable WARP Client SOCKS5 Proxy (upstream: client tunnel protocol; port: 40000)
     unproxy         Disable WARP Client Proxy Mode
     wg              Install WireGuard and related components
     wg4             Configuration WARP IPv4 Global Network (with WireGuard), all IPv4 outbound data over the WARP network
@@ -1338,7 +1881,7 @@ SUBCOMMANDS:
     status          Prints status information
     version         Prints version information
     help            Prints this message or the help of the given subcommand(s)
-    menu            Chinese special features menu
+    menu            Chinese management menu, including usque SOCKS5 (upstream: HTTP/2 / TCP+TLS)
 "
 }
 

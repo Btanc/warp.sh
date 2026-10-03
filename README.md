@@ -8,6 +8,7 @@ A Bash script that automatically installs and configures CloudFlare WARP in Linu
 
 - Automatically install CloudFlare WARP Official Linux Client
 - Quickly enable WARP Proxy Mode, access WARP network with SOCKS5
+- Manage a separate usque SOCKS5 proxy with an HTTP/2 (TCP + TLS) upstream
 - Automatically install WireGuard related components
 - Configuration WARP IPv4 Network interface (WireGuard Mode)
 - Configuration WARP IPv6 Network interface (WireGuard Mode)
@@ -38,6 +39,10 @@ Supported platform architecture:
 - x86_64(amd64)
 - ARMv8(aarch64)
 - ARMv7(armhf)
+
+### usque SOCKS5 Proxy
+
+Requires Linux with systemd, `curl`, `unzip`, `sha256sum`, and `ss`. The installer selects the latest stable [usque release](https://github.com/Diniboy1123/usque/releases) for the machine's architecture and verifies its SHA256 checksum before installation.
 
 ## Usage
 
@@ -96,11 +101,42 @@ menu            Chinese special features menu
     bash warp.sh proxy
     ```
 
+### Manage usque
+
+Open the menu and select `9` (manage usque / WARP proxy):
+
+```bash
+sudo bash warp.sh menu
+```
+
+The usque submenu provides:
+
+```text
+1  Install or update usque
+2  Enable SOCKS5 proxy (upstream: HTTP/2 / TCP + TLS)
+3  Disable SOCKS5 proxy (upstream: HTTP/2 / TCP + TLS)
+4  Restart SOCKS5 proxy (upstream: HTTP/2 / TCP + TLS)
+5  Change the IPv4 listen address and port
+6  Test the proxy's outbound connection
+7  View service logs
+8  Uninstall usque, keeping the account configuration
+0  Return to the main menu
+```
+
+The default listener is `127.0.0.1:40000`. usque runs as the independent `usque-warp.service` systemd service with `socks --http2 --always-reconnect`; its connection to Cloudflare uses HTTP/2 over TCP + TLS. The binary is installed at `/usr/local/bin/usque`, account credentials are stored in `/etc/usque/config.json`, and listener settings are stored in `/etc/usque/proxy.conf`.
+
+On first enable, the script reuses the account configuration at that fixed path. If none exists, it imports an existing `config.json` from the current directory or runs usque's `register` command. Updating, disabling, and uninstalling usque preserve the account configuration. If another process owns the requested port, the script reports the conflict; use submenu option `5` to select a different port. The official WARP proxy also defaults to port `40000`, so choose separate ports to run both.
+
+`bash warp.sh status` includes usque status. usque management is available through the menu; no additional CLI subcommands are added. Official WARP SOCKS5 menu labels display the configured protocol from `warp-cli settings`: `WireGuard / UDP` or `MASQUE`. The MASQUE setting does not identify whether its current transport is QUIC or HTTP/2.
+
+Run the isolated regression tests with `bash tests/usque.sh`. They use temporary files and mock network and service operations.
+
 ## Credits
 
 - [Cloudflare WARP](https://1.1.1.1/)
 - [WireGuard](https://www.wireguard.com/)
 - [ViRb3/wgcf](https://github.com/ViRb3/wgcf)
+- [Diniboy1123/usque](https://github.com/Diniboy1123/usque)
 
 ## License
 
