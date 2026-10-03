@@ -51,6 +51,7 @@ setup_case() {
     mkdir -p "$CASE/bin" "$CASE/unit" "$CASE/fixtures"
     MOCK_DOWNLOAD_FAIL=0 MOCK_HASH_FAIL=0 MOCK_ARCHIVE_FAIL=0 MOCK_PORT_BUSY=0
     MOCK_START_FAIL=0 MOCK_REGISTER_FAIL=0 MOCK_CURL_FAIL=0
+    MOCK_SS_FAIL=0 MOCK_NO_LISTENER=0
     MOCK_MISSING_COMMAND=''
     MOCK_WARP_PROTOCOL='WireGuard' MOCK_WARP_FAIL=0
     export CASE OPS MOCK_REGISTER_FAIL
@@ -114,6 +115,8 @@ systemctl() {
 }
 ss() {
     record ss "$@"
+    [[ $MOCK_SS_FAIL == 0 ]] || return 1
+    [[ $MOCK_NO_LISTENER == 0 ]] || return 0
     if [[ $MOCK_PORT_BUSY == 1 ]]; then
         printf 'LISTEN 0 128 127.0.0.1:40000 0.0.0.0:* users:(("warp-svc",pid=42,fd=3))\n'
     elif [[ -f $CASE/active ]]; then
@@ -249,8 +252,34 @@ test_status_and_logs() {
     assert_eq "$Usque_Status" active 'running service status'
     assert_eq "$Usque_SelfStart_en" Enabled 'autostart status'
     assert_eq "$Usque_Version" v1.0.0 'installed version'
+    assert_eq "$Usque_Proxy_Status" on 'owned listener proxy status'
     expect_ok Print_Usque_Log
     assert_contains "$OPS" '^journalctl <-u> <usque-warp>' 'log command targets wrong service'
+}
+
+test_proxy_status_tracks_owned_listener() {
+    existing_account
+    expect_ok Enable_Usque_Proxy
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Proxy_Status" on 'running proxy status'
+    MOCK_PORT_BUSY=1
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Status" active 'foreign listener changed service status'
+    assert_eq "$Usque_Proxy_Status" off 'foreign PID was reported as working usque proxy'
+    MOCK_PORT_BUSY=0 MOCK_NO_LISTENER=1
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Proxy_Status" off 'active service without listener reported proxy on'
+    MOCK_NO_LISTENER=0 MOCK_MISSING_COMMAND=ss
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Proxy_Status" unknown 'missing ss was reported as a verified proxy status'
+    MOCK_MISSING_COMMAND='' MOCK_SS_FAIL=1
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Proxy_Status" unknown 'failed ss query was reported as a verified proxy status'
+    MOCK_SS_FAIL=0
+    expect_ok Disable_Usque_Proxy
+    expect_ok Check_Usque_Status
+    assert_eq "$Usque_Status" inactive 'stopped service status'
+    assert_eq "$Usque_Proxy_Status" off 'stopped proxy status'
 }
 
 test_disable_only_usque_and_keeps_account() {
@@ -407,7 +436,18 @@ test_official_protocol_detection() {
     assert_eq "$WARP_Upstream_Protocol_en" MASQUE 'official MASQUE protocol'
     MOCK_WARP_FAIL=1
     Get_WARP_Upstream_Protocol > "$CASE/output" 2>&1 || true
-    assert_eq "$WARP_Upstream_Protocol_en" Unknown 'failed detection must not claim protocol'
+    assert_eq "$WARP_Upstream_Protocol_en" 'Settings unavailable' 'failed settings detection reason'
+    assert_eq "$WARP_Upstream_Protocol_zh" '设置读取失败' 'failed settings detection Chinese reason'
+    MOCK_WARP_FAIL=0 MOCK_WARP_PROTOCOL=unrecognized
+    expect_ok Get_WARP_Upstream_Protocol
+    assert_eq "$WARP_Upstream_Protocol_en" 'Unknown protocol' 'unknown protocol detection reason'
+    MOCK_MISSING_COMMAND=warp-cli
+    expect_ok Get_WARP_Upstream_Protocol
+    assert_eq "$WARP_Upstream_Protocol_en" 'Not installed' 'missing client detection reason'
+    MOCK_MISSING_COMMAND='' WARP_Client_Status=inactive
+    expect_ok Get_WARP_Upstream_Protocol
+    assert_eq "$WARP_Upstream_Protocol_en" 'Client stopped' 'stopped client detection reason'
+    assert_eq "$WARP_Upstream_Protocol_zh" '客户端未运行' 'stopped client Chinese reason'
 }
 
 test_main_menu_routes_nine() {
@@ -416,9 +456,20 @@ test_main_menu_routes_nine() {
     Menu_Title=test
     WARP_Client_Status_zh='' WARP_Proxy_Status_zh='' WireGuard_Status_zh=''
     WARP_IPv4_Status_zh='' WARP_IPv6_Status_zh='' WARP_Upstream_Protocol_zh=''
+    Usque_Status_zh='service-status-marker' Usque_Proxy_Status_zh='proxy-status-marker'
+    Usque_Listen_Address_zh='listen-address-marker'
     Menu_Usque() { record menu-usque; }
     expect_ok Start_Menu <<< 9
     assert_contains "$OPS" '^menu-usque$' 'main option 9 does not open usque menu'
+    assert_contains "$CASE/output" service-status-marker 'main menu omits usque service status'
+    assert_contains "$CASE/output" proxy-status-marker 'main menu omits usque SOCKS5 status'
+    WARP_Client_Status_en='' WARP_Proxy_Status_en='' WireGuard_Status_en=''
+    WARP_IPv4_Status_en='' WARP_IPv6_Status_en='' WARP_Upstream_Protocol_en=''
+    Usque_Status_en='service-status-marker' Usque_Proxy_Status_en='proxy-status-marker'
+    Usque_Listen_Address_en='listen-address-marker'
+    expect_ok Print_ALL_Status
+    assert_contains "$CASE/output" service-status-marker 'status command omits usque service status'
+    assert_contains "$CASE/output" proxy-status-marker 'status command omits usque SOCKS5 status'
 }
 
 test_usque_submenu_routes_actions() {
@@ -427,6 +478,7 @@ test_usque_submenu_routes_actions() {
         Usque_Status_zh=test
         Usque_SelfStart_zh=test
         Usque_Listen_Address_zh=test
+        Usque_Proxy_Status_zh='proxy-status-marker'
     }
     clear() { :; }
     Menu_Title=test
@@ -443,6 +495,7 @@ test_usque_submenu_routes_actions() {
     for option in {1..8}; do
         : > "$OPS"
         expect_ok Menu_Usque <<< "$option"
+        assert_contains "$CASE/output" proxy-status-marker 'usque submenu omits SOCKS5 status'
         action=${actions[$((option - 1))]}
         assert_eq "$(cat "$OPS")" "menu-$action" "submenu option $option"
     done
@@ -456,6 +509,7 @@ test_invalid_settings_do_not_block_service_management() {
     expect_ok Check_Usque_Status
     assert_eq "$Usque_Status" active 'bad settings concealed running service'
     assert_eq "$Usque_Listen_Address_en" 'Invalid proxy.conf' 'bad settings address label'
+    assert_eq "$Usque_Proxy_Status" invalid-config 'bad settings proxy status'
     clear() { :; }
     Menu_Title=test
     : > "$OPS"
@@ -486,6 +540,7 @@ for test in \
     test_first_registration_is_private \
     test_registration_failure_does_not_start_service \
     test_status_and_logs \
+    test_proxy_status_tracks_owned_listener \
     test_disable_only_usque_and_keeps_account \
     test_foreign_listener_is_not_killed \
     test_start_failure_does_not_fall_back \

@@ -477,12 +477,21 @@ Get_WARP_Proxy_Port() {
 
 Get_WARP_Upstream_Protocol() {
     local settings protocol
-    WARP_Upstream_Protocol_zh='未检测'
-    WARP_Upstream_Protocol_en='Unknown'
-    if [[ ${WARP_Client_Status} != active ]] || ! command -v warp-cli >/dev/null 2>&1; then
+    WARP_Upstream_Protocol_zh="${FontColor_Red}未安装${FontColor_Suffix}"
+    WARP_Upstream_Protocol_en="${FontColor_Red}Not installed${FontColor_Suffix}"
+    if ! command -v warp-cli >/dev/null 2>&1; then
         return 0
     fi
+    if [[ ${WARP_Client_Status} != active ]]; then
+        WARP_Upstream_Protocol_zh="${FontColor_Red}客户端未运行${FontColor_Suffix}"
+        WARP_Upstream_Protocol_en="${FontColor_Red}Client stopped${FontColor_Suffix}"
+        return 0
+    fi
+    WARP_Upstream_Protocol_zh="${FontColor_Red}设置读取失败${FontColor_Suffix}"
+    WARP_Upstream_Protocol_en="${FontColor_Red}Settings unavailable${FontColor_Suffix}"
     settings=$(warp_cli_run settings 2>/dev/null) || return 0
+    WARP_Upstream_Protocol_zh="${FontColor_Red}未知协议${FontColor_Suffix}"
+    WARP_Upstream_Protocol_en="${FontColor_Red}Unknown protocol${FontColor_Suffix}"
     protocol=$(printf '%s\n' "${settings}" | awk '
         tolower($0) ~ /tunnel protocol[[:space:]]*:/ {
             sub(/^.*:[[:space:]]*/, "")
@@ -1001,14 +1010,14 @@ Check_WARP_WireGuard_Status() {
         WARP_IPv4_Status_zh="${WARP_IPv4_Status_en}"
         ;;
     off)
-        WARP_IPv4_Status_en="Normal"
-        WARP_IPv4_Status_zh="正常"
+        WARP_IPv4_Status_en="${FontColor_Green}Normal${FontColor_Suffix}"
+        WARP_IPv4_Status_zh="${FontColor_Green}正常${FontColor_Suffix}"
         ;;
     *)
         Check_Network_Status_IPv4
         if [[ ${IPv4Status} = on ]]; then
-            WARP_IPv4_Status_en="Normal"
-            WARP_IPv4_Status_zh="正常"
+            WARP_IPv4_Status_en="${FontColor_Green}Normal${FontColor_Suffix}"
+            WARP_IPv4_Status_zh="${FontColor_Green}正常${FontColor_Suffix}"
         else
             WARP_IPv4_Status_en="${FontColor_Red}Unconnected${FontColor_Suffix}"
             WARP_IPv4_Status_zh="${FontColor_Red}未连接${FontColor_Suffix}"
@@ -1031,14 +1040,14 @@ Check_WARP_WireGuard_Status() {
         WARP_IPv6_Status_zh="${WARP_IPv6_Status_en}"
         ;;
     off)
-        WARP_IPv6_Status_en="Normal"
-        WARP_IPv6_Status_zh="正常"
+        WARP_IPv6_Status_en="${FontColor_Green}Normal${FontColor_Suffix}"
+        WARP_IPv6_Status_zh="${FontColor_Green}正常${FontColor_Suffix}"
         ;;
     *)
         Check_Network_Status_IPv6
         if [[ ${IPv6Status} = on ]]; then
-            WARP_IPv6_Status_en="Normal"
-            WARP_IPv6_Status_zh="正常"
+            WARP_IPv6_Status_en="${FontColor_Green}Normal${FontColor_Suffix}"
+            WARP_IPv6_Status_zh="${FontColor_Green}正常${FontColor_Suffix}"
         else
             WARP_IPv6_Status_en="${FontColor_Red}Unconnected${FontColor_Suffix}"
             WARP_IPv6_Status_zh="${FontColor_Red}未连接${FontColor_Suffix}"
@@ -1101,7 +1110,7 @@ Print_ALL_Status() {
  IPv6 Network\t: ${WARP_IPv6_Status_en}
  ----------------------------
  usque\t\t: ${Usque_Status_en}
- SOCKS5 (upstream: HTTP/2 / TCP+TLS): ${Usque_Listen_Address_en}
+ SOCKS5 (upstream: HTTP/2 / TCP+TLS): ${Usque_Proxy_Status_en}
  ----------------------------
 "
 }
@@ -1321,15 +1330,22 @@ EOF
     fi
 }
 
+Usque_Is_Listening() {
+    local listeners main_pid
+    Usque_Require_Command ss || return 2
+    main_pid=$(systemctl show "${Usque_Service}" --property=MainPID --value 2>/dev/null) || return 2
+    listeners=$(ss -H -ltnp "sport = :${Usque_Port}" 2>/dev/null) || return 2
+    [[ ${main_pid} =~ ^[1-9][0-9]*$ && ${listeners} = *"pid=${main_pid},"* ]]
+}
+
 Wait_Usque_Proxy() {
-    local attempt listeners main_pid
+    local attempt status
     for (( attempt=0; attempt<10; attempt++ )); do
         if systemctl is-active --quiet "${Usque_Service}"; then
-            main_pid=$(systemctl show "${Usque_Service}" --property=MainPID --value 2>/dev/null)
-            listeners=$(ss -H -ltnp "sport = :${Usque_Port}" 2>/dev/null) || return 1
-            if [[ ${main_pid} =~ ^[1-9][0-9]*$ && ${listeners} = *"pid=${main_pid},"* ]]; then
-                return 0
-            fi
+            Usque_Is_Listening
+            status=$?
+            (( status == 0 )) && return 0
+            (( status == 2 )) && return 1
         fi
         sleep 1
     done
@@ -1611,42 +1627,68 @@ Uninstall_Usque() {
 }
 
 Check_Usque_Status() {
-    local enabled output
+    local enabled output listener_status
     Usque_Status='not-installed'
-    Usque_Status_zh='未安装'
-    Usque_Status_en='Not installed'
+    Usque_Status_zh="${FontColor_Red}未安装${FontColor_Suffix}"
+    Usque_Status_en="${FontColor_Red}Not installed${FontColor_Suffix}"
     Usque_Version='-'
-    Usque_SelfStart_zh='未启用'
-    Usque_SelfStart_en='Disabled'
-    Usque_Listen_Address_zh='配置异常（请检查 proxy.conf）'
-    Usque_Listen_Address_en='Invalid proxy.conf'
+    Usque_SelfStart_zh="${FontColor_Red}未启用${FontColor_Suffix}"
+    Usque_SelfStart_en="${FontColor_Red}Disabled${FontColor_Suffix}"
+    Usque_Proxy_Status='invalid-config'
+    Usque_Proxy_Status_zh="${FontColor_Red}配置异常${FontColor_Suffix}"
+    Usque_Proxy_Status_en="${FontColor_Red}Invalid proxy.conf${FontColor_Suffix}"
+    Usque_Listen_Address_zh="${FontColor_Red}配置异常（请检查 proxy.conf）${FontColor_Suffix}"
+    Usque_Listen_Address_en="${FontColor_Red}Invalid proxy.conf${FontColor_Suffix}"
     if Load_Usque_Settings; then
         Usque_Listen_Address_zh="socks5://${Usque_Bind}:${Usque_Port}"
         Usque_Listen_Address_en="${Usque_Listen_Address_zh}"
+        Usque_Proxy_Status='off'
+        Usque_Proxy_Status_zh="${FontColor_Red}未开启${FontColor_Suffix}"
+        Usque_Proxy_Status_en="${FontColor_Red}Off${FontColor_Suffix}"
     fi
     if [[ -x ${Usque_BinPath} ]]; then
         output=$("${Usque_BinPath}" -c /dev/null version 2>/dev/null)
         Usque_Version=$(printf '%s\n' "${output}" | sed -n 's/^usque version: //p' | head -n 1)
         Usque_Version="${Usque_Version:--}"
         Usque_Status='inactive'
-        Usque_Status_zh='未运行'
-        Usque_Status_en='Stopped'
+        Usque_Status_zh="${FontColor_Red}未运行${FontColor_Suffix}"
+        Usque_Status_en="${FontColor_Red}Stopped${FontColor_Suffix}"
     fi
     if command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet "${Usque_Service}"; then
             Usque_Status='active'
-            Usque_Status_zh='运行中'
-            Usque_Status_en='Running'
+            Usque_Status_zh="${FontColor_Green}运行中${FontColor_Suffix}"
+            Usque_Status_en="${FontColor_Green}Running${FontColor_Suffix}"
         elif systemctl is-failed --quiet "${Usque_Service}"; then
             Usque_Status='failed'
-            Usque_Status_zh='启动失败'
-            Usque_Status_en='Failed'
+            Usque_Status_zh="${FontColor_Red}启动失败${FontColor_Suffix}"
+            Usque_Status_en="${FontColor_Red}Failed${FontColor_Suffix}"
         fi
         enabled=$(systemctl is-enabled "${Usque_Service}" 2>/dev/null)
         if [[ ${enabled} = enabled ]]; then
-            Usque_SelfStart_zh='已启用'
-            Usque_SelfStart_en='Enabled'
+            Usque_SelfStart_zh="${FontColor_Green}已启用${FontColor_Suffix}"
+            Usque_SelfStart_en="${FontColor_Green}Enabled${FontColor_Suffix}"
         fi
+    fi
+    if [[ ${Usque_Status} = active && ${Usque_Proxy_Status} != invalid-config ]]; then
+        Usque_Is_Listening
+        listener_status=$?
+        case ${listener_status} in
+        0)
+            Usque_Proxy_Status='on'
+            Usque_Proxy_Status_zh="${FontColor_Green}已开启（${Usque_Bind}:${Usque_Port}）${FontColor_Suffix}"
+            Usque_Proxy_Status_en="${FontColor_Green}Listening (${Usque_Bind}:${Usque_Port})${FontColor_Suffix}"
+            ;;
+        1)
+            Usque_Proxy_Status_zh="${FontColor_Red}未监听${FontColor_Suffix}"
+            Usque_Proxy_Status_en="${FontColor_Red}Not listening${FontColor_Suffix}"
+            ;;
+        *)
+            Usque_Proxy_Status='unknown'
+            Usque_Proxy_Status_zh="${FontColor_Red}监听状态读取失败${FontColor_Suffix}"
+            Usque_Proxy_Status_en="${FontColor_Red}Listener status unavailable${FontColor_Suffix}"
+            ;;
+        esac
     fi
 }
 
@@ -1759,6 +1801,7 @@ ${Menu_Title}
  -------------------------
  usque 版本    : ${Usque_Version}
  服务状态     : ${Usque_Status_zh}
+ SOCKS5 状态（上游：HTTP/2 / TCP+TLS）: ${Usque_Proxy_Status_zh}
  SOCKS5 地址（上游：HTTP/2 / TCP+TLS）: ${Usque_Listen_Address_zh}
  开机启动     : ${Usque_SelfStart_zh}
  账户配置     : ${Usque_ConfigPath}
@@ -1805,6 +1848,10 @@ ${Menu_Title}
  WireGuard 状态 : ${WireGuard_Status_zh}
  IPv4 网络状态  : ${WARP_IPv4_Status_zh}
  IPv6 网络状态  : ${WARP_IPv6_Status_zh}
+ -------------------------
+
+ usque 服务状态 : ${Usque_Status_zh}
+ SOCKS5 代理（上游：HTTP/2 / TCP+TLS）: ${Usque_Proxy_Status_zh}
  -------------------------
 
  ${FontColor_Green_Bold}1${FontColor_Suffix}. 安装 Cloudflare WARP 官方客户端

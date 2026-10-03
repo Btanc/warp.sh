@@ -127,7 +127,7 @@ The default listener is `127.0.0.1:40000`. usque runs as the independent `usque-
 
 On first enable, the script reuses the account configuration at that fixed path. If none exists, it imports an existing `config.json` from the current directory or runs usque's `register` command. Updating, disabling, and uninstalling usque preserve the account configuration. If another process owns the requested port, the script reports the conflict; use submenu option `5` to select a different port. The official WARP proxy also defaults to port `40000`, so choose separate ports to run both.
 
-`bash warp.sh status` includes usque status. usque management is available through the menu; no additional CLI subcommands are added. Official WARP SOCKS5 menu labels display the configured protocol from `warp-cli settings`: `WireGuard / UDP` or `MASQUE`. The MASQUE setting does not identify whether its current transport is QUIC or HTTP/2.
+The main menu and `bash warp.sh status` show both the usque service state and SOCKS5 listener state. A running service is only reported as listening when its own process owns the configured TCP port; outbound connectivity is checked separately with submenu option `6`. usque management is available through the menu; no additional CLI subcommands are added. Official WARP SOCKS5 menu labels display the configured protocol from `warp-cli settings`: `WireGuard / UDP` or `MASQUE`. When the official client is stopped, the label explains that its settings cannot be read. The MASQUE setting does not identify whether its current transport is QUIC or HTTP/2.
 
 Run the isolated regression tests with `bash tests/usque.sh`. They use temporary files and mock network and service operations.
 
