@@ -3,7 +3,7 @@
 # https://github.com/P3TERX/warp.sh
 # Description: Cloudflare WARP Installer
 # System Required: Debian, Ubuntu, Fedora, CentOS, Oracle Linux, Arch Linux
-# Version: 1.0.40_Final
+# Version: 1.0.43_Final
 #
 # MIT License
 #
@@ -28,7 +28,7 @@
 # SOFTWARE.
 #
 
-shVersion='1.0.40_Final'
+shVersion='1.0.43_Final'
 
 FontColor_Red="\033[31m"
 FontColor_Red_Bold="\033[1;31m"
@@ -39,6 +39,133 @@ FontColor_Yellow_Bold="\033[1;33m"
 FontColor_Purple="\033[35m"
 FontColor_Purple_Bold="\033[1;35m"
 FontColor_Suffix="\033[0m"
+
+WARP_CLI_ACCEPT_TOS=''
+WARP_CLI_HELP=''
+WARP_CLI_LAST_OUTPUT=''
+WARP_CLI_LAST_STATUS=0
+
+warp_cli_detect() {
+    if [[ -n ${WARP_CLI_HELP} ]]; then
+        return
+    fi
+    WARP_CLI_HELP="$(warp-cli --help 2>&1 || true)"
+    if echo "${WARP_CLI_HELP}" | grep -q -- '--accept-tos'; then
+        WARP_CLI_ACCEPT_TOS='--accept-tos'
+    fi
+}
+
+warp_cli_run() {
+    warp_cli_detect
+    if [[ -n ${WARP_CLI_ACCEPT_TOS} ]]; then
+        warp-cli ${WARP_CLI_ACCEPT_TOS} "$@"
+    else
+        warp-cli "$@"
+    fi
+}
+
+warp_cli_try() {
+    local output status
+    output="$(warp_cli_run "$@" 2>&1)"
+    status=$?
+    WARP_CLI_LAST_OUTPUT="${output}"
+    WARP_CLI_LAST_STATUS=${status}
+    echo "${output}"
+    if [[ ${status} -eq 0 ]]; then
+        return 0
+    fi
+    if echo "${output}" | grep -qi 'unrecognized subcommand'; then
+        return 2
+    fi
+    return ${status}
+}
+
+warp_cli_registration_show() {
+    local output status
+    output="$(warp_cli_try registration show)"
+    status=$?
+    if [[ ${status} -eq 0 ]]; then
+        echo "${output}"
+        return 0
+    fi
+    if [[ ${status} -eq 2 ]]; then
+        output="$(warp_cli_try account)"
+        status=$?
+    fi
+    echo "${output}"
+    return ${status}
+}
+
+warp_cli_registration_new() {
+    local output status
+    output="$(warp_cli_try registration new)"
+    status=$?
+    if [[ ${status} -eq 0 ]]; then
+        echo "${output}"
+        return 0
+    fi
+    if [[ ${status} -eq 2 ]]; then
+        output="$(warp_cli_try register)"
+        status=$?
+    fi
+    echo "${output}"
+    return ${status}
+}
+
+warp_cli_is_registered() {
+    local output status
+    output="$(warp_cli_registration_show 2>&1)"
+    status=$?
+    if echo "${output}" | grep -qiE 'missing|not registered|no registration'; then
+        return 1
+    fi
+    if [[ ${status} -ne 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+warp_cli_connect() {
+    warp_cli_run connect
+}
+
+warp_cli_disconnect() {
+    warp_cli_run disconnect
+}
+
+warp_cli_enable_always_on() {
+    warp_cli_detect
+    if echo "${WARP_CLI_HELP}" | grep -qi 'always-on'; then
+        warp_cli_run enable-always-on || true
+    fi
+}
+
+warp_cli_disable_always_on() {
+    warp_cli_detect
+    if echo "${WARP_CLI_HELP}" | grep -qi 'always-on'; then
+        warp_cli_run disable-always-on || true
+    fi
+}
+
+warp_cli_mode_proxy() {
+    local output status
+    output="$(warp_cli_try mode proxy)"
+    status=$?
+    if [[ ${status} -eq 0 ]]; then
+        echo "${output}"
+        return 0
+    fi
+    if [[ ${status} -eq 2 ]]; then
+        output="$(warp_cli_try set-mode proxy)"
+        status=$?
+        if [[ ${status} -eq 0 ]]; then
+            echo "${output}"
+            return 0
+        fi
+    fi
+    echo "${output}"
+    return ${status}
+}
 
 log() {
     local LEVEL="$1"
@@ -153,7 +280,7 @@ Install_Requirements_Debian() {
 Install_WARP_Client_Debian() {
     if [[ ${SysInfo_OS_Name_lowercase} = ubuntu ]]; then
         case ${SysInfo_OS_CodeName} in
-        bionic | focal | jammy) ;;
+        noble | jammy | focal | bionic | xenial) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -161,7 +288,7 @@ Install_WARP_Client_Debian() {
         esac
     elif [[ ${SysInfo_OS_Name_lowercase} = debian ]]; then
         case ${SysInfo_OS_CodeName} in
-        bookworm | buster | bullseye) ;;
+        trixie | bookworm | bullseye | buster | stretch) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -169,7 +296,7 @@ Install_WARP_Client_Debian() {
         esac
     fi
     Install_Requirements_Debian
-    curl https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${SysInfo_OS_CodeName} main" | tee /etc/apt/sources.list.d/cloudflare-client.list
     apt update
     apt install cloudflare-warp -y
@@ -177,7 +304,9 @@ Install_WARP_Client_Debian() {
 
 Install_WARP_Client_CentOS() {
     if [[ ${SysInfo_OS_Ver_major} = 8 ]]; then
-        rpm -ivh http://pkg.cloudflareclient.com/cloudflare-release-el8.rpm
+        rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
+        curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
+        yum update -y
         yum install cloudflare-warp -y
     else
         log ERROR "This operating system is not supported."
@@ -262,35 +391,48 @@ Init_WARP_Client() {
     if [[ ${WARP_Client_SelfStart} != enabled || ${WARP_Client_Status} != active ]]; then
         Install_WARP_Client
     fi
-    if [[ $(warp-cli --accept-tos account) = *Missing* ]]; then
+    if ! warp_cli_is_registered; then
         log INFO "Cloudflare WARP Account Registration in progress..."
-        warp-cli --accept-tos register
+        if ! warp_cli_registration_new; then
+            log ERROR "Cloudflare WARP Account registration failed."
+            return 1
+        fi
     fi
 }
 
 Connect_WARP() {
     log INFO "Connecting to WARP..."
-    warp-cli --accept-tos connect
+    if ! warp_cli_connect; then
+        log ERROR "Failed to connect to WARP."
+        return 1
+    fi
     log INFO "Enable WARP Always-On..."
-    warp-cli --accept-tos enable-always-on
+    warp_cli_enable_always_on
 }
 
 Disconnect_WARP() {
     log INFO "Disable WARP Always-On..."
-    warp-cli --accept-tos disable-always-on
+    warp_cli_disable_always_on
     log INFO "Disconnect from WARP..."
-    warp-cli --accept-tos disconnect
+    warp_cli_disconnect
 }
 
 Set_WARP_Mode_Proxy() {
     log INFO "Setting up WARP Proxy Mode..."
-    warp-cli --accept-tos set-mode proxy
+    if ! warp_cli_mode_proxy; then
+        if echo "${WARP_CLI_LAST_OUTPUT}" | grep -qiE 'unrecognized subcommand|invalid|unknown'; then
+            log ERROR "WARP CLI proxy mode is not supported in this version."
+        else
+            log ERROR "Failed to set WARP Proxy Mode."
+        fi
+        return 1
+    fi
 }
 
 Enable_WARP_Client_Proxy() {
-    Init_WARP_Client
-    Set_WARP_Mode_Proxy
-    Connect_WARP
+    Init_WARP_Client || return 1
+    Set_WARP_Mode_Proxy || return 1
+    Connect_WARP || return 1
     Print_WARP_Client_Status
 }
 
@@ -743,6 +885,9 @@ Check_WARP_Proxy_Status() {
     if [[ ${WARP_Client_Status} = active ]]; then
         Get_WARP_Proxy_Port
         WARP_Proxy_Status=$(curl -sx "socks5h://127.0.0.1:${WARP_Proxy_Port}" ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
+        if [[ -z ${WARP_Proxy_Status} ]]; then
+            WARP_Proxy_Status=$(curl -x "http://127.0.0.1:${WARP_Proxy_Port}" ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
+        fi
     else
         unset WARP_Proxy_Status
     fi
