@@ -389,7 +389,12 @@ Restart_WARP_Client() {
 Init_WARP_Client() {
     Check_WARP_Client
     if [[ ${WARP_Client_SelfStart} != enabled || ${WARP_Client_Status} != active ]]; then
-        Install_WARP_Client
+        if [[ -z $(command -v warp-cli) ]]; then
+            Install_WARP_Client
+        elif ! systemctl enable warp-svc --now; then
+            log ERROR "Failed to enable Cloudflare WARP Client."
+            return 1
+        fi
     fi
     if ! warp_cli_is_registered; then
         log INFO "Cloudflare WARP Account Registration in progress..."
@@ -415,6 +420,27 @@ Disconnect_WARP() {
     warp_cli_disable_always_on
     log INFO "Disconnect from WARP..."
     warp_cli_disconnect
+}
+
+Disable_WARP_Client() {
+    local load_state
+    if ! load_state=$(systemctl show warp-svc --property=LoadState --value); then
+        log ERROR "Failed to check Cloudflare WARP Client."
+        return 1
+    fi
+    if [[ ${load_state} = not-found ]]; then
+        log INFO "Cloudflare WARP Client is not installed."
+        return 0
+    fi
+    if systemctl is-active --quiet warp-svc && command -v warp-cli >/dev/null 2>&1; then
+        Disconnect_WARP || log WARN "Failed to disconnect WARP; stopping the service."
+    fi
+    log INFO "Disabling Cloudflare WARP Client..."
+    if ! systemctl disable warp-svc --now; then
+        log ERROR "Failed to disable Cloudflare WARP Client."
+        return 1
+    fi
+    log INFO "Cloudflare WARP Client is stopped and disabled. Configuration has been preserved."
 }
 
 Set_WARP_Mode_Proxy() {
@@ -1152,6 +1178,7 @@ ${Menu_Title}
  ${FontColor_Green_Bold}2${FontColor_Suffix}. 关闭 SOCKS5 代理
  ${FontColor_Green_Bold}3${FontColor_Suffix}. 重启 WARP 官方客户端
  ${FontColor_Green_Bold}4${FontColor_Suffix}. 卸载 WARP 官方客户端
+ ${FontColor_Green_Bold}5${FontColor_Suffix}. 关闭 WARP 官方客户端（保留配置，禁用开机启动）
 "
     unset MenuNumber
     read -p "请输入选项: " MenuNumber
@@ -1171,6 +1198,9 @@ ${Menu_Title}
         ;;
     4)
         Uninstall_WARP_Client
+        ;;
+    5)
+        Disable_WARP_Client
         ;;
     *)
         log ERROR "无效输入！"

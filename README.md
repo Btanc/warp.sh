@@ -86,6 +86,16 @@ menu            Chinese special features menu
     bash <(curl -fsSL git.io/warp.sh) wg
     ```
 
+- Stop the official WARP client and disable automatic startup while preserving installed components, accounts, and configuration. Open the menu, select `3` (manage the official client), then `5` (turn off the official client).
+    ```bash
+    bash warp.sh menu
+    ```
+
+    To restore the official client proxy and enable automatic startup:
+    ```bash
+    bash warp.sh proxy
+    ```
+
 ## Credits
 
 - [Cloudflare WARP](https://1.1.1.1/)
